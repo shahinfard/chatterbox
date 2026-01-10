@@ -7,12 +7,15 @@ import io
 import logging
 import os
 import sys
+import subprocess
 from pathlib import Path
 from typing import Literal, Optional, Generator
 import time
 
 import torch
 import torchaudio
+import soundfile as sf
+import numpy as np
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel, Field, validator
@@ -197,57 +200,109 @@ def convert_audio_format(
     if audio_tensor.dim() == 1:
         audio_tensor = audio_tensor.unsqueeze(0)
 
-    # Move to CPU if needed
-    audio_tensor = audio_tensor.cpu()
+    # Move to CPU and convert to numpy
+    audio_np = audio_tensor.cpu().numpy()
+
+    # Convert to float32 if needed
+    if audio_np.dtype != np.float32:
+        audio_np = audio_np.astype(np.float32)
 
     # Create in-memory buffer
     buffer = io.BytesIO()
 
     if output_format == "pcm":
         # Raw PCM 16-bit
-        audio_np = (audio_tensor.numpy() * 32767).astype('int16')
-        buffer.write(audio_np.tobytes())
+        audio_int16 = (audio_np * 32767).astype('int16')
+        buffer.write(audio_int16.tobytes())
+
     elif output_format == "wav":
-        # WAV format
-        torchaudio.save(
-            buffer,
-            audio_tensor,
-            sample_rate,
-            format="wav"
-        )
+        # WAV format using soundfile
+        sf.write(buffer, audio_np.T, sample_rate, format='WAV')
+
     elif output_format == "mp3":
-        # MP3 format
-        torchaudio.save(
-            buffer,
-            audio_tensor,
-            sample_rate,
-            format="mp3"
-        )
+        # MP3 format using ffmpeg subprocess
+        try:
+            # Write WAV to temp buffer first
+            wav_buffer = io.BytesIO()
+            sf.write(wav_buffer, audio_np.T, sample_rate, format='WAV')
+            wav_buffer.seek(0)
+
+            # Convert WAV to MP3 using ffmpeg
+            process = subprocess.Popen(
+                ['ffmpeg', '-i', 'pipe:0', '-f', 'mp3', '-q:a', '9', 'pipe:1'],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            mp3_data, err = process.communicate(input=wav_buffer.getvalue())
+
+            if process.returncode != 0:
+                logger.warning(f"FFmpeg MP3 encoding had issues, falling back to WAV")
+                wav_buffer.seek(0)
+                return wav_buffer.getvalue()
+
+            return mp3_data
+        except FileNotFoundError:
+            logger.warning("FFmpeg not found, falling back to WAV format")
+            wav_buffer = io.BytesIO()
+            sf.write(wav_buffer, audio_np.T, sample_rate, format='WAV')
+            return wav_buffer.getvalue()
+
     elif output_format == "flac":
-        # FLAC format
-        torchaudio.save(
-            buffer,
-            audio_tensor,
-            sample_rate,
-            format="flac"
-        )
-    elif output_format == "opus":
-        # Opus format (save as OGG/Opus)
-        torchaudio.save(
-            buffer,
-            audio_tensor,
-            sample_rate,
-            format="ogg",
-            encoder="opus"
-        )
+        # FLAC format using soundfile
+        sf.write(buffer, audio_np.T, sample_rate, format='FLAC')
+
+    elif output_format in ["opus", "ogg"]:
+        # Opus format - use ffmpeg since soundfile doesn't support it well
+        try:
+            wav_buffer = io.BytesIO()
+            sf.write(wav_buffer, audio_np.T, sample_rate, format='WAV')
+            wav_buffer.seek(0)
+
+            process = subprocess.Popen(
+                ['ffmpeg', '-i', 'pipe:0', '-f', 'ogg', '-c:a', 'libopus', 'pipe:1'],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            opus_data, err = process.communicate(input=wav_buffer.getvalue())
+
+            if process.returncode != 0:
+                logger.warning(f"FFmpeg Opus encoding failed, falling back to WAV")
+                return wav_buffer.getvalue()
+
+            return opus_data
+        except FileNotFoundError:
+            logger.warning("FFmpeg not found for Opus, falling back to WAV format")
+            wav_buffer = io.BytesIO()
+            sf.write(wav_buffer, audio_np.T, sample_rate, format='WAV')
+            return wav_buffer.getvalue()
+
     elif output_format == "aac":
-        # AAC format
-        torchaudio.save(
-            buffer,
-            audio_tensor,
-            sample_rate,
-            format="mp4"
-        )
+        # AAC format using ffmpeg
+        try:
+            wav_buffer = io.BytesIO()
+            sf.write(wav_buffer, audio_np.T, sample_rate, format='WAV')
+            wav_buffer.seek(0)
+
+            process = subprocess.Popen(
+                ['ffmpeg', '-i', 'pipe:0', '-f', 'adts', '-c:a', 'aac', 'pipe:1'],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            aac_data, err = process.communicate(input=wav_buffer.getvalue())
+
+            if process.returncode != 0:
+                logger.warning(f"FFmpeg AAC encoding failed, falling back to WAV")
+                return wav_buffer.getvalue()
+
+            return aac_data
+        except FileNotFoundError:
+            logger.warning("FFmpeg not found for AAC, falling back to WAV format")
+            wav_buffer = io.BytesIO()
+            sf.write(wav_buffer, audio_np.T, sample_rate, format='WAV')
+            return wav_buffer.getvalue()
     else:
         raise ValueError(f"Unsupported audio format: {output_format}")
 
