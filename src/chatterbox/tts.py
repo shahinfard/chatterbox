@@ -270,3 +270,97 @@ class ChatterboxTTS:
             wav = wav.squeeze(0).detach().cpu().numpy()
             watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
         return torch.from_numpy(watermarked_wav).unsqueeze(0)
+
+    def generate_stream(
+        self,
+        text,
+        audio_prompt_path=None,
+        exaggeration=0.5,
+        cfg_weight=0.5,
+        temperature=0.8,
+        chunk_size=25,
+        context_window=50,
+        fade_duration=0.02,
+        repetition_penalty=1.2,
+        min_p=0.05,
+        top_p=1.0,
+        print_metrics=False,
+    ):
+        """
+        Stream audio chunks from generated speech.
+
+        Generates complete audio and yields it in chunks with metrics.
+
+        Args:
+            text: Text to generate speech for
+            audio_prompt_path: Path to voice sample for cloning
+            exaggeration: Emotion exaggeration level (0.0-1.0)
+            cfg_weight: Classifier-free guidance weight
+            temperature: Sampling temperature
+            chunk_size: Number of audio frames per chunk (at sample rate)
+            context_window: Unused (for API compatibility)
+            fade_duration: Fade duration for chunk transitions
+            repetition_penalty: T3 repetition penalty
+            min_p: T3 min_p sampling parameter
+            top_p: T3 top_p sampling parameter
+            print_metrics: Whether to print metrics
+
+        Yields:
+            (audio_chunk_tensor, metrics) tuples
+        """
+        from dataclasses import dataclass
+        import time
+
+        @dataclass
+        class StreamMetrics:
+            chunk_count: int
+            latency_to_first_chunk: float
+            rtf: float
+
+        # Generate complete audio
+        start_time = time.time()
+        audio_tensor = self.generate(
+            text=text,
+            repetition_penalty=repetition_penalty,
+            min_p=min_p,
+            top_p=top_p,
+            audio_prompt_path=audio_prompt_path,
+            exaggeration=exaggeration,
+            cfg_weight=cfg_weight,
+            temperature=temperature,
+        )
+
+        # Convert to numpy for chunking
+        audio_data = audio_tensor.squeeze(0).cpu().numpy()
+        audio_duration = len(audio_data) / self.sr
+
+        # Calculate chunk size in samples
+        chunk_samples = int(chunk_size * self.sr / 1000)  # chunk_size is in milliseconds
+        fade_samples = int(fade_duration * self.sr)
+
+        # Stream audio in chunks
+        chunk_count = 0
+        first_chunk_time = None
+
+        for i in range(0, len(audio_data), chunk_samples):
+            chunk = audio_data[i:i + chunk_samples]
+
+            # Record time to first chunk
+            if chunk_count == 0:
+                first_chunk_time = time.time() - start_time
+
+            # Convert chunk back to tensor
+            chunk_tensor = torch.from_numpy(chunk).unsqueeze(0)
+
+            # Create metrics
+            total_time = time.time() - start_time
+            rtf = total_time / audio_duration if audio_duration > 0 else 0
+
+            metrics = StreamMetrics(
+                chunk_count=chunk_count + 1,
+                latency_to_first_chunk=first_chunk_time if first_chunk_time is not None else total_time,
+                rtf=rtf
+            )
+
+            chunk_count += 1
+            yield chunk_tensor, metrics
