@@ -353,6 +353,7 @@ async def root():
         "endpoints": {
             "tts": "/v1/audio/speech",
             "voices": "/v1/audio/voices",
+            "voices_voxta": "/v1/audio/voices/voxta",
             "models": "/v1/models",
             "health": "/health"
         }
@@ -424,6 +425,29 @@ async def list_voices():
         "object": "list",
         "data": voices
     }
+
+
+@app.get("/v1/audio/voices/voxta")
+async def list_voices_voxta():
+    """
+    List available voices in Voxta-compatible format
+
+    Returns list of available voice presets as a direct array
+    for compatibility with Voxta's dynamic voice discovery.
+    """
+    voices = []
+    for voice_id, voice_file in ServerConfig.VOICE_PRESETS.items():
+        voice_path = ServerConfig.VOICE_SAMPLES_DIR / voice_file
+
+        voices.append({
+            "id": voice_id,
+            "name": voice_id.capitalize(),
+            "description": f"Voice clone based on {voice_file}",
+            "preview_url": None,
+            "available": voice_path.exists()
+        })
+
+    return voices
 
 
 @app.post("/v1/audio/speech")
@@ -544,39 +568,92 @@ def stream_audio_generator(
     temperature: float
 ) -> Generator[bytes, None, None]:
     """
-    Generate streaming audio chunks
+    Generate streaming audio chunks compatible with OpenAI TTS streaming format
 
-    Yields audio chunks as bytes in the requested format
+    For proper streaming, sends WAV header once then raw PCM chunks.
+    This allows clients to receive and play audio progressively.
     """
-    logger.info("Starting streaming generation...")
+    logger.info(f"Starting streaming generation (format: {output_format})...")
 
     try:
-        # Generate audio stream
-        for audio_chunk, metrics in model.generate_stream(
-            text=text,
-            audio_prompt_path=voice_path,
-            exaggeration=exaggeration,
-            cfg_weight=cfg_weight,
-            temperature=temperature,
-            chunk_size=ServerConfig.DEFAULT_CHUNK_SIZE,
-            context_window=ServerConfig.DEFAULT_CONTEXT_WINDOW,
-            fade_duration=ServerConfig.DEFAULT_FADE_DURATION,
-            print_metrics=False
-        ):
-            # Convert chunk to requested format
-            chunk_data = convert_audio_format(
-                audio_chunk,
+        # For WAV streaming: Send header once, then raw PCM chunks
+        if output_format == "wav":
+            # Generate complete audio first
+            audio_tensor = model.generate(
+                text=text,
+                audio_prompt_path=voice_path,
+                exaggeration=exaggeration,
+                cfg_weight=cfg_weight,
+                temperature=temperature
+            )
+
+            # Convert to numpy for processing
+            audio_np = audio_tensor.cpu().numpy()
+            if audio_np.ndim > 1:
+                audio_np = audio_np.squeeze(0)
+
+            # Ensure float32
+            if audio_np.dtype != np.float32:
+                audio_np = audio_np.astype(np.float32)
+
+            # Generate WAV header
+            wav_buffer = io.BytesIO()
+            sf.write(wav_buffer, audio_np, ServerConfig.SAMPLE_RATE, format='WAV')
+            wav_buffer.seek(0)
+            wav_data = wav_buffer.getvalue()
+
+            # Extract header (first 44 bytes for standard WAV, or find data chunk)
+            # Standard WAV header is 44 bytes, but we'll find the "data" chunk marker
+            header_end = wav_data.find(b'data') + 8  # "data" + 4 bytes size
+            wav_header = wav_data[:header_end]
+
+            # Yield header first
+            logger.info("Sending WAV header")
+            yield wav_header
+
+            # Yield audio in chunks
+            chunk_size = ServerConfig.DEFAULT_CHUNK_SIZE * ServerConfig.SAMPLE_RATE // 1000  # Convert ms to samples
+            chunk_size = max(chunk_size, 4096)  # At least 4KB chunks
+
+            for i in range(0, len(audio_np), chunk_size):
+                chunk = audio_np[i:i + chunk_size]
+                # Convert to raw PCM bytes (int16)
+                chunk_int16 = (chunk * 32767).astype('int16')
+                chunk_bytes = chunk_int16.tobytes()
+                yield chunk_bytes
+
+                if i == 0:
+                    logger.info(f"First audio chunk sent (chunk size: {len(chunk_bytes)} bytes)")
+
+            logger.info(f"Streaming complete. Total audio: {len(audio_np)/ServerConfig.SAMPLE_RATE:.2f}s")
+
+        else:
+            # For non-WAV formats, generate complete audio then stream in chunks
+            audio_tensor = model.generate(
+                text=text,
+                audio_prompt_path=voice_path,
+                exaggeration=exaggeration,
+                cfg_weight=cfg_weight,
+                temperature=temperature
+            )
+
+            # Convert entire audio to requested format
+            audio_data = convert_audio_format(
+                audio_tensor,
                 ServerConfig.SAMPLE_RATE,
                 output_format
             )
 
-            if metrics.chunk_count == 1:
-                logger.info(f"First chunk latency: {metrics.latency_to_first_chunk:.3f}s")
+            # Stream in chunks
+            chunk_size = 8192  # 8KB chunks for encoded formats
+            for i in range(0, len(audio_data), chunk_size):
+                chunk = audio_data[i:i + chunk_size]
+                yield chunk
 
-            yield chunk_data
+                if i == 0:
+                    logger.info(f"First chunk sent ({output_format}, size: {len(chunk)} bytes)")
 
-        logger.info(f"Streaming complete. Total chunks: {metrics.chunk_count}, "
-                   f"RTF: {metrics.rtf:.3f}")
+            logger.info(f"Streaming complete. Total size: {len(audio_data)} bytes ({output_format})")
 
     except Exception as e:
         logger.error(f"Error in streaming generation: {e}", exc_info=True)
