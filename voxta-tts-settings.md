@@ -13,7 +13,7 @@ Replace `192.168.1.225` with your server's IP address if different.
 
 ## Request Body
 
-### Basic Configuration (Recommended - Non-Streaming)
+### Basic Configuration (Recommended - Streaming)
 
 ```json
 {
@@ -21,11 +21,11 @@ Replace `192.168.1.225` with your server's IP address if different.
   "voice": "her",
   "model": "tts-1",
   "response_format": "wav",
-  "stream": false
+  "stream": true
 }
 ```
 
-**Note:** This is the tested and working configuration for Voxta. Streaming is not yet supported.
+**Note:** Streaming is now fully supported for lower latency responses. For non-streaming mode, set `"stream": false`.
 
 ### Full Configuration (with optional parameters)
 
@@ -35,7 +35,7 @@ Replace `192.168.1.225` with your server's IP address if different.
   "voice": "her",
   "model": "tts-1",
   "response_format": "wav",
-  "stream": false,
+  "stream": true,
   "speed": 1.0,
   "exaggeration": 0.5,
   "temperature": 0.8
@@ -123,7 +123,7 @@ Replace `192.168.1.225` with your server's IP address if different.
   "input": "{{ text }}",
   "voice": "her",
   "response_format": "wav",
-  "stream": false,
+  "stream": true,
   "exaggeration": 0.8,
   "temperature": 1.0
 }
@@ -152,7 +152,7 @@ curl -X POST http://192.168.1.225:5005/v1/audio/speech \
     "input": "Hello, this is a test of the Chatterbox TTS API.",
     "voice": "her",
     "response_format": "wav",
-    "stream": false
+    "stream": true
   }' \
   --output test_output.wav
 ```
