@@ -6,8 +6,10 @@ Implements /v1/audio/speech endpoint compatible with OpenAI's TTS API
 import io
 import logging
 import os
+import re
 import sys
 import subprocess
+import threading
 from pathlib import Path
 from typing import Literal, Optional, Generator
 import time
@@ -18,13 +20,14 @@ import soundfile as sf
 import numpy as np
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse, Response
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, validator
 import uvicorn
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
-from chatterbox.tts import ChatterboxTTS
+from chatterbox.tts_turbo import ChatterboxTurboTTS, Conditionals
 
 # Configure logging
 logging.basicConfig(
@@ -42,32 +45,94 @@ class ServerConfig:
     """Server configuration"""
     HOST = "0.0.0.0"
     PORT = 5005
-    MODEL_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    # Use cuda:0 directly (shared with main LLM)
+    MODEL_DEVICE = "cuda:0"
 
     # Voice samples directory
     VOICE_SAMPLES_DIR = Path(__file__).parent
 
     # Voice presets mapping
+    # Note: Chatterbox Turbo has ONE default voice in conds.pt
+    # All other voices require audio sample files for voice cloning
     VOICE_PRESETS = {
-        "her": "HER-sample1.wav",
-        "laura": "laura-voice.wav",
-        "emilia": "emilia-clarke-tts-file.wav",
-        "david": "david-attenborough.wav",
-        "morgan": "morgan-freeman.wav",   # Fallback to HER
-        "nova": "HER-sample1.wav",   # Fallback to HER
-        "shimmer": "HER-sample1.wav" # Fallback to HER
+        # Default voice (uses built-in conds.pt when no sample file specified).
+        # This is the ONLY hardcoded entry — it has no sample file so it can't
+        # be auto-discovered. Every other voice is registered from its audio
+        # file at boot by discover_voices(), so custom presets aren't listed
+        # here: renaming a file just changes its id on the next restart, with
+        # no dead entries left behind.
+        "her": None,  # Default voice (built-in)
     }
 
-    # TTS generation defaults
-    DEFAULT_EXAGGERATION = 0.5
-    DEFAULT_CFG_WEIGHT = 0.5
+    # Audio extensions treated as voice samples during auto-detection
+    VOICE_FILE_EXTENSIONS = (".mp3", ".wav", ".flac")
+
+    # Filename stems to skip when auto-detecting (test/output artifacts)
+    VOICE_IGNORE_PREFIXES = ("test_", "test-", "test_output", "output")
+
+    @staticmethod
+    def _slugify_voice_id(stem: str) -> str:
+        """Turn a filename stem into a clean voice id (lowercase, hyphenated)."""
+        slug = stem.strip().lower()
+        slug = re.sub(r"[\s_]+", "-", slug)
+        slug = re.sub(r"[^a-z0-9-]", "", slug)
+        slug = re.sub(r"-+", "-", slug).strip("-")
+        return slug
+
+    @classmethod
+    def discover_voices(cls):
+        """
+        Scan VOICE_SAMPLES_DIR for audio files and register any that aren't
+        already mapped by an explicit preset above. Curated presets take
+        priority (their IDs and filenames are preserved); this only adds
+        newly-dropped sample files so they appear without a code change.
+        """
+        known_files = {f for f in cls.VOICE_PRESETS.values() if f}
+        added = 0
+        for path in sorted(cls.VOICE_SAMPLES_DIR.iterdir()):
+            if not path.is_file() or path.suffix.lower() not in cls.VOICE_FILE_EXTENSIONS:
+                continue
+            if path.name in known_files:
+                continue  # already registered under a curated id
+            if path.stem.lower().startswith(cls.VOICE_IGNORE_PREFIXES):
+                logger.debug(f"Skipping non-voice audio file: {path.name}")
+                continue
+            voice_id = cls._slugify_voice_id(path.stem)
+            if not voice_id or voice_id in cls.VOICE_PRESETS:
+                continue
+            cls.VOICE_PRESETS[voice_id] = path.name
+            added += 1
+            logger.info(f"Auto-detected voice '{voice_id}' -> {path.name}")
+        logger.info(
+            f"Voice presets ready: {len(cls.VOICE_PRESETS)} total "
+            f"({added} auto-detected)"
+        )
+
+    # TTS generation defaults (Chatterbox Turbo)
+    # Note: Turbo does not support exaggeration or cfg_weight
+    # These parameters are ignored by the Turbo model
     DEFAULT_TEMPERATURE = 0.8
+    DEFAULT_TOP_P = 0.95
+    DEFAULT_TOP_K = 1000
+    DEFAULT_REPETITION_PENALTY = 1.2
+    DEFAULT_NORM_LOUDNESS = True
+    
+    # Streaming settings
     DEFAULT_CHUNK_SIZE = 25
     DEFAULT_CONTEXT_WINDOW = 50
     DEFAULT_FADE_DURATION = 0.02
 
+    # Text chunking settings
+    MAX_CHUNK_CHARS = 250  # Max characters per chunk sent to the model
+    CROSSFADE_SAMPLES = 2400  # 100ms crossfade at 24kHz between chunks
+
     # Audio output settings
     SAMPLE_RATE = 24000  # S3GEN_SR from Chatterbox
+
+    # Concurrency: max simultaneous GPU generations. Extra requests queue (FIFO)
+    # rather than all contending for the same GPU at once, which keeps each
+    # in-flight request fast enough to stay inside the audio playback window.
+    MAX_IN_FLIGHT = 3
 
 
 # ============================================================================
@@ -100,16 +165,17 @@ class TTSRequest(BaseModel):
         le=4.0
     )
 
-    # Extended parameters for Chatterbox-specific control
+    # Extended parameters for Chatterbox Turbo
+    # Note: exaggeration and cfg_weight are not supported by Turbo
     exaggeration: Optional[float] = Field(
         default=None,
-        description="Emotion exaggeration (0.0 to 1.0)",
+        description="Emotion exaggeration (not supported by Turbo model)",
         ge=0.0,
         le=1.0
     )
     cfg_weight: Optional[float] = Field(
         default=None,
-        description="Classifier-free guidance weight",
+        description="Classifier-free guidance weight (not supported by Turbo)",
         ge=0.0,
         le=5.0
     )
@@ -118,6 +184,28 @@ class TTSRequest(BaseModel):
         description="Sampling temperature",
         ge=0.1,
         le=2.0
+    )
+    top_k: Optional[int] = Field(
+        default=None,
+        description="Top-k sampling (Turbo only)",
+        ge=1,
+        le=1000
+    )
+    top_p: Optional[float] = Field(
+        default=None,
+        description="Top-p (nucleus) sampling",
+        ge=0.0,
+        le=1.0
+    )
+    repetition_penalty: Optional[float] = Field(
+        default=None,
+        description="Repetition penalty",
+        ge=1.0,
+        le=2.0
+    )
+    norm_loudness: Optional[bool] = Field(
+        default=None,
+        description="Normalize loudness to -27 LUFS"
     )
     stream: bool = Field(
         default=False,
@@ -140,24 +228,99 @@ class TTSRequest(BaseModel):
 class ModelManager:
     """Manages the TTS model instance"""
     def __init__(self):
-        self.model: Optional[ChatterboxTTS] = None
+        self.model: Optional[ChatterboxTurboTTS] = None
         self.device = ServerConfig.MODEL_DEVICE
+        # Per-voice conditionals, encoded once and kept resident in VRAM.
+        # Memory-only by design: the audio files are the single source of truth,
+        # so swapping a voice is just "replace the file + restart" — there is no
+        # stale on-disk cache to invalidate.
+        self.voice_conds: dict[str, Conditionals] = {}
 
     def load_model(self):
-        """Load the Chatterbox TTS model"""
+        """Load the Chatterbox Turbo TTS model"""
         if self.model is None:
-            logger.info(f"Loading Chatterbox TTS model on device: {self.device}")
+            logger.info(f"Loading Chatterbox Turbo TTS model on device: {self.device}")
             try:
-                self.model = ChatterboxTTS.from_pretrained(device=self.device)
-                logger.info("Model loaded successfully")
+                self.model = ChatterboxTurboTTS.from_pretrained(device=self.device)
+                logger.info("Turbo model loaded successfully")
             except Exception as e:
                 logger.error(f"Failed to load model: {e}")
                 raise
         return self.model
 
-    def get_voice_path(self, voice_name: str) -> Path:
-        """Get the path to voice sample file"""
-        voice_file = ServerConfig.VOICE_PRESETS.get(voice_name, "HER-sample1.wav")
+    def build_voice_cache(self):
+        """
+        Encode every discovered voice into a Conditionals object once and hold
+        them all in VRAM. Runs at startup, after discover_voices() and the model
+        load. The built-in 'her' voice already carries its conditionals on the
+        model, so we reuse those directly.
+        """
+        built = 0
+        t_start = time.time()
+        for voice_id, voice_file in ServerConfig.VOICE_PRESETS.items():
+            try:
+                if voice_file is None:
+                    # Built-in default voice: model.conds is already populated.
+                    if self.model.conds is not None:
+                        self.voice_conds[voice_id] = self.model.conds
+                    continue
+                path = ServerConfig.VOICE_SAMPLES_DIR / voice_file
+                if not path.exists():
+                    logger.warning(f"Skipping voice '{voice_id}': file not found ({path})")
+                    continue
+                t0 = time.time()
+                self.voice_conds[voice_id] = self.model.build_conditionals(str(path))
+                built += 1
+                logger.info(f"Cached voice conds '{voice_id}' in {time.time() - t0:.2f}s")
+            except Exception as e:
+                logger.warning(f"Failed to cache conds for '{voice_id}': {e}")
+        logger.info(
+            f"Voice conds cache ready: {len(self.voice_conds)} voices resident in VRAM "
+            f"({built} encoded) in {time.time() - t_start:.1f}s"
+        )
+
+    def get_conds(self, voice_name: str) -> Conditionals:
+        """
+        Return the cached Conditionals for a voice. Falls back to encoding on
+        first use if a voice somehow isn't in the boot-time cache (e.g. a file
+        dropped in after startup), then caches it.
+        """
+        conds = self.voice_conds.get(voice_name)
+        if conds is not None:
+            return conds
+
+        # Lazy fallback — should be rare once build_voice_cache() has run.
+        voice_path = self.get_voice_path(voice_name)  # may raise FileNotFoundError
+        if voice_path is None:
+            conds = self.model.conds  # built-in voice
+        else:
+            logger.info(f"Voice '{voice_name}' not pre-cached; encoding on first use")
+            conds = self.model.build_conditionals(voice_path)
+        self.voice_conds[voice_name] = conds
+        return conds
+
+    def get_voice_path(self, voice_name: str) -> Optional[str]:
+        """
+        Get the path to voice sample file or None for default built-in voice.
+        
+        Returns:
+            - Path to voice sample file for custom voices
+            - None for default built-in voice (uses model's conds.pt)
+            - Raises FileNotFoundError if voice sample file not found
+        """
+        voice_file = ServerConfig.VOICE_PRESETS.get(voice_name)
+        
+        # Voice not in presets
+        if voice_file is None and voice_name not in ServerConfig.VOICE_PRESETS:
+            logger.warning(f"Unknown voice '{voice_name}', using default voice")
+            return None
+        
+        # Default voice (None value means use built-in conds.pt)
+        if voice_file is None:
+            logger.debug(f"Using default built-in voice: {voice_name}")
+            return None
+        
+        # Custom voice with sample file
         voice_path = ServerConfig.VOICE_SAMPLES_DIR / voice_file
 
         if not voice_path.exists():
@@ -167,13 +330,109 @@ class ModelManager:
                 alt_path = voice_path.with_suffix(ext)
                 if alt_path.exists():
                     logger.info(f"Using alternative voice file: {alt_path}")
-                    return alt_path
+                    return str(alt_path)
             raise FileNotFoundError(f"Voice sample not found: {voice_path}")
 
-        return voice_path
+        return str(voice_path)
 
 
 model_manager = ModelManager()
+
+# Bounds how many requests run GPU generation at once. Acquired inside the
+# threadpool worker that runs model.generate(), so it applies to both the
+# streaming and non-streaming paths.
+_gpu_slots = threading.Semaphore(ServerConfig.MAX_IN_FLIGHT)
+
+
+# ============================================================================
+# Text Chunking
+# ============================================================================
+
+def split_text_into_chunks(text: str, max_chars: int = ServerConfig.MAX_CHUNK_CHARS) -> list[str]:
+    """
+    Split long text into chunks suitable for TTS generation.
+
+    Splits on sentence boundaries first, then falls back to clause boundaries
+    (commas, semicolons, dashes) if a sentence is still too long.
+    Preserves punctuation so the model gets proper intonation cues.
+    """
+    if len(text) <= max_chars:
+        return [text]
+
+    # Split into sentences (keep the delimiter attached)
+    sentence_pattern = re.compile(r'(?<=[.!?])\s+')
+    sentences = sentence_pattern.split(text.strip())
+
+    chunks = []
+    current_chunk = ""
+
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+
+        # If adding this sentence keeps us under the limit, accumulate
+        if current_chunk and len(current_chunk) + len(sentence) + 1 <= max_chars:
+            current_chunk += " " + sentence
+        elif not current_chunk and len(sentence) <= max_chars:
+            current_chunk = sentence
+        else:
+            # Flush the current chunk if we have one
+            if current_chunk:
+                chunks.append(current_chunk)
+                current_chunk = ""
+
+            # If the sentence itself is too long, split on clause boundaries
+            if len(sentence) > max_chars:
+                clause_parts = re.split(r'(?<=[,;\-])\s+', sentence)
+                for part in clause_parts:
+                    part = part.strip()
+                    if not part:
+                        continue
+                    if current_chunk and len(current_chunk) + len(part) + 1 <= max_chars:
+                        current_chunk += " " + part
+                    else:
+                        if current_chunk:
+                            chunks.append(current_chunk)
+                        current_chunk = part
+            else:
+                current_chunk = sentence
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    return chunks
+
+
+def crossfade_audio(chunks: list[torch.Tensor], fade_samples: int = ServerConfig.CROSSFADE_SAMPLES) -> torch.Tensor:
+    """
+    Concatenate audio chunks with a short crossfade to avoid clicks/pops.
+    """
+    if len(chunks) == 1:
+        return chunks[0]
+
+    # Ensure all chunks are 1D
+    processed = []
+    for c in chunks:
+        if c.dim() > 1:
+            c = c.squeeze(0)
+        processed.append(c)
+
+    result = processed[0]
+    for next_chunk in processed[1:]:
+        overlap = min(fade_samples, result.shape[0], next_chunk.shape[0])
+        if overlap > 0:
+            fade_out = torch.linspace(1.0, 0.0, overlap, device=result.device)
+            fade_in = torch.linspace(0.0, 1.0, overlap, device=next_chunk.device)
+            # Blend the overlap region
+            result_tail = result[-overlap:] * fade_out
+            next_head = next_chunk[:overlap] * fade_in
+            blended = result_tail + next_head
+            result = torch.cat([result[:-overlap], blended, next_chunk[overlap:]])
+        else:
+            result = torch.cat([result, next_chunk])
+
+    return result.unsqueeze(0)  # Back to [1, samples]
 
 
 # ============================================================================
@@ -229,7 +488,7 @@ def convert_audio_format(
 
             # Convert WAV to MP3 using ffmpeg
             process = subprocess.Popen(
-                ['ffmpeg', '-i', 'pipe:0', '-f', 'mp3', '-q:a', '9', 'pipe:1'],
+                ['ffmpeg', '-i', 'pipe:0', '-f', 'mp3', '-q:a', '2', 'pipe:1'],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE
@@ -338,7 +597,9 @@ async def startup_event():
     """Load model on startup"""
     logger.info("Starting Chatterbox TTS API server...")
     try:
+        ServerConfig.discover_voices()
         model_manager.load_model()
+        model_manager.build_voice_cache()
         logger.info("Server ready to accept requests")
     except Exception as e:
         logger.error(f"Failed to start server: {e}")
@@ -411,14 +672,22 @@ async def list_voices():
     """
     voices = []
     for voice_id, voice_file in ServerConfig.VOICE_PRESETS.items():
-        voice_path = ServerConfig.VOICE_SAMPLES_DIR / voice_file
+        # Default voice (uses model's built-in conds.pt)
+        if voice_file is None:
+            description = "Default Chatterbox Turbo voice"
+            available = True
+        else:
+            # Custom voice with sample file
+            voice_path = ServerConfig.VOICE_SAMPLES_DIR / voice_file
+            description = f"Voice clone based on {voice_file}"
+            available = voice_path.exists()
 
         voices.append({
             "id": voice_id,
             "name": voice_id.capitalize(),
-            "description": f"Voice clone based on {voice_file}",
+            "description": description,
             "preview_url": None,
-            "available": voice_path.exists()
+            "available": available
         })
 
     return {
@@ -437,14 +706,22 @@ async def list_voices_voxta():
     """
     voices = []
     for voice_id, voice_file in ServerConfig.VOICE_PRESETS.items():
-        voice_path = ServerConfig.VOICE_SAMPLES_DIR / voice_file
+        # Default voice (uses model's built-in conds.pt)
+        if voice_file is None:
+            description = "Default Chatterbox Turbo voice"
+            available = True
+        else:
+            # Custom voice with sample file
+            voice_path = ServerConfig.VOICE_SAMPLES_DIR / voice_file
+            description = f"Voice clone based on {voice_file}"
+            available = voice_path.exists()
 
         voices.append({
             "id": voice_id,
             "name": voice_id.capitalize(),
-            "description": f"Voice clone based on {voice_file}",
+            "description": description,
             "preview_url": None,
-            "available": voice_path.exists()
+            "available": available
         })
 
     return voices
@@ -463,16 +740,23 @@ async def create_speech(request: TTSRequest):
         if model is None:
             raise HTTPException(status_code=503, detail="Model not loaded")
 
-        # Get voice sample path
+        # Resolve the voice to its cached (VRAM-resident) conditionals.
         try:
-            voice_path = model_manager.get_voice_path(request.voice)
+            conds = model_manager.get_conds(request.voice)
         except FileNotFoundError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
-        # Get generation parameters
-        exaggeration = request.exaggeration or ServerConfig.DEFAULT_EXAGGERATION
-        cfg_weight = request.cfg_weight or ServerConfig.DEFAULT_CFG_WEIGHT
+        # Get generation parameters (Turbo-specific)
+        # Note: exaggeration and cfg_weight are not supported by Turbo
         temperature = request.temperature or ServerConfig.DEFAULT_TEMPERATURE
+        top_k = request.top_k or ServerConfig.DEFAULT_TOP_K
+        top_p = request.top_p or ServerConfig.DEFAULT_TOP_P
+        repetition_penalty = request.repetition_penalty or ServerConfig.DEFAULT_REPETITION_PENALTY
+        norm_loudness = request.norm_loudness if request.norm_loudness is not None else ServerConfig.DEFAULT_NORM_LOUDNESS
+
+        # Warn if user tried to use unsupported parameters
+        if request.exaggeration is not None or request.cfg_weight is not None:
+            logger.warning("exaggeration and cfg_weight are not supported by Chatterbox Turbo and will be ignored")
 
         logger.info(f"Generating speech for voice='{request.voice}', "
                    f"format='{request.response_format}', stream={request.stream}, "
@@ -485,11 +769,13 @@ async def create_speech(request: TTSRequest):
                 stream_audio_generator(
                     model=model,
                     text=request.input,
-                    voice_path=str(voice_path),
+                    conds=conds,  # cached, VRAM-resident per-voice conditionals
                     output_format=request.response_format,
-                    exaggeration=exaggeration,
-                    cfg_weight=cfg_weight,
-                    temperature=temperature
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    repetition_penalty=repetition_penalty,
+                    norm_loudness=norm_loudness
                 ),
                 media_type=get_content_type(request.response_format),
                 headers={
@@ -498,15 +784,21 @@ async def create_speech(request: TTSRequest):
                 }
             )
         else:
-            # Non-streaming response
-            audio_data = generate_complete_audio(
+            # Non-streaming response.
+            # generate_complete_audio() does blocking GPU work; run it in a
+            # threadpool so it doesn't stall uvicorn's event loop and serialise
+            # concurrent requests (e.g. simultaneous agents in a group turn).
+            audio_data = await run_in_threadpool(
+                generate_complete_audio,
                 model=model,
                 text=request.input,
-                voice_path=str(voice_path),
+                conds=conds,  # cached, VRAM-resident per-voice conditionals
                 output_format=request.response_format,
-                exaggeration=exaggeration,
-                cfg_weight=cfg_weight,
-                temperature=temperature
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                norm_loudness=norm_loudness
             )
 
             return Response(
@@ -522,35 +814,60 @@ async def create_speech(request: TTSRequest):
 
 
 def generate_complete_audio(
-    model: ChatterboxTTS,
+    model: ChatterboxTurboTTS,
     text: str,
-    voice_path: str,
+    conds: Conditionals,
     output_format: str,
-    exaggeration: float,
-    cfg_weight: float,
-    temperature: float
+    temperature: float,
+    top_k: int,
+    top_p: float,
+    repetition_penalty: float,
+    norm_loudness: bool
 ) -> bytes:
     """
     Generate complete audio (non-streaming)
 
     Returns complete audio file as bytes
+
+    Args:
+        conds: Cached per-voice conditionals (built once at startup)
     """
     start_time = time.time()
 
-    # Generate audio
-    audio_tensor = model.generate(
-        text=text,
-        audio_prompt_path=voice_path,
-        exaggeration=exaggeration,
-        cfg_weight=cfg_weight,
-        temperature=temperature
-    )
+    # Split long text into chunks to prevent model degradation
+    text_chunks = split_text_into_chunks(text)
+
+    if len(text_chunks) > 1:
+        logger.info(f"Split text into {len(text_chunks)} chunks for generation")
+
+    # Hold one GPU slot for the whole generation (all chunks); format conversion
+    # below runs outside the slot so it doesn't hog the GPU cap.
+    audio_chunks = []
+    with _gpu_slots:
+        for i, chunk_text in enumerate(text_chunks):
+            logger.debug(f"Generating chunk {i+1}/{len(text_chunks)}: {chunk_text[:60]}...")
+            chunk_audio = model.generate(
+                text=chunk_text,
+                conds=conds,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                norm_loudness=norm_loudness,
+            )
+            audio_chunks.append(chunk_audio)
+
+    # Concatenate chunks with crossfade
+    if len(audio_chunks) == 1:
+        audio_tensor = audio_chunks[0]
+    else:
+        audio_tensor = crossfade_audio(audio_chunks)
 
     generation_time = time.time() - start_time
     audio_duration = audio_tensor.shape[-1] / ServerConfig.SAMPLE_RATE
     rtf = generation_time / audio_duration if audio_duration > 0 else 0
 
-    logger.info(f"Generated {audio_duration:.2f}s audio in {generation_time:.2f}s (RTF: {rtf:.3f})")
+    logger.info(f"Turbo generated {audio_duration:.2f}s audio in {generation_time:.2f}s (RTF: {rtf:.3f})")
 
     # Convert to requested format
     audio_data = convert_audio_format(audio_tensor, ServerConfig.SAMPLE_RATE, output_format)
@@ -559,34 +876,59 @@ def generate_complete_audio(
 
 
 def stream_audio_generator(
-    model: ChatterboxTTS,
+    model: ChatterboxTurboTTS,
     text: str,
-    voice_path: str,
+    conds: Conditionals,
     output_format: str,
-    exaggeration: float,
-    cfg_weight: float,
-    temperature: float
+    temperature: float,
+    top_k: int,
+    top_p: float,
+    repetition_penalty: float,
+    norm_loudness: bool
 ) -> Generator[bytes, None, None]:
     """
     Generate streaming audio chunks compatible with OpenAI TTS streaming format
 
     For proper streaming, sends WAV header once then raw PCM chunks.
     This allows clients to receive and play audio progressively.
+
+    Note: Turbo model does not support exaggeration or cfg_weight.
+
+    Args:
+        conds: Cached per-voice conditionals (built once at startup)
     """
     logger.info(f"Starting streaming generation (format: {output_format})...")
 
     try:
+        # Generate full audio with text chunking (shared by both paths)
+        text_chunks = split_text_into_chunks(text)
+        if len(text_chunks) > 1:
+            logger.info(f"Streaming: split text into {len(text_chunks)} chunks")
+
+        # Hold one GPU slot for the whole generation; byte streaming below runs
+        # outside the slot.
+        audio_parts = []
+        with _gpu_slots:
+            for i, chunk_text in enumerate(text_chunks):
+                logger.debug(f"Streaming chunk {i+1}/{len(text_chunks)}: {chunk_text[:60]}...")
+                part = model.generate(
+                    text=chunk_text,
+                    conds=conds,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    repetition_penalty=repetition_penalty,
+                    norm_loudness=norm_loudness,
+                )
+                audio_parts.append(part)
+
+        if len(audio_parts) == 1:
+            audio_tensor = audio_parts[0]
+        else:
+            audio_tensor = crossfade_audio(audio_parts)
+
         # For WAV streaming: Send header once, then raw PCM chunks
         if output_format == "wav":
-            # Generate complete audio first
-            audio_tensor = model.generate(
-                text=text,
-                audio_prompt_path=voice_path,
-                exaggeration=exaggeration,
-                cfg_weight=cfg_weight,
-                temperature=temperature
-            )
-
             # Convert to numpy for processing
             audio_np = audio_tensor.cpu().numpy()
             if audio_np.ndim > 1:
@@ -628,16 +970,7 @@ def stream_audio_generator(
             logger.info(f"Streaming complete. Total audio: {len(audio_np)/ServerConfig.SAMPLE_RATE:.2f}s")
 
         else:
-            # For non-WAV formats, generate complete audio then stream in chunks
-            audio_tensor = model.generate(
-                text=text,
-                audio_prompt_path=voice_path,
-                exaggeration=exaggeration,
-                cfg_weight=cfg_weight,
-                temperature=temperature
-            )
-
-            # Convert entire audio to requested format
+            # For non-WAV formats, convert full audio then stream in byte chunks
             audio_data = convert_audio_format(
                 audio_tensor,
                 ServerConfig.SAMPLE_RATE,

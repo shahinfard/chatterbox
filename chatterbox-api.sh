@@ -1,14 +1,12 @@
 #!/bin/bash
 # Chatterbox TTS API Server Startup Script
-# This script activates the venv and runs the API server on GPU 1 (RTX 4090)
+# This script activates the venv and runs the API server
+# GPU selection is handled in openai_api_server.py (cuda:1 = RTX 5090)
 
 set -e
 
 # Get script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-# Pin to GPU 1 (RTX 5090)
-export CUDA_VISIBLE_DEVICES=0
 
 # Activate virtual environment
 source "${SCRIPT_DIR}/venv/bin/activate"

@@ -192,9 +192,10 @@ class ChatterboxTurboTTS:
                 print("MPS not available because the current MacOS version is not 12.3+ and/or you do not have an MPS-enabled device on this machine.")
             device = "cpu"
 
+        # Try to use cached model first, no authentication required for cached models
         local_path = snapshot_download(
             repo_id=REPO_ID,
-            token=os.getenv("HF_TOKEN") or True,
+            token=None,  # Use cached model without requiring authentication
             # Optional: Filter to download only what you need
             allow_patterns=["*.safetensors", "*.json", "*.txt", "*.pt", "*.model"]
         )
@@ -214,7 +215,18 @@ class ChatterboxTurboTTS:
 
         return wav
 
-    def prepare_conditionals(self, wav_fpath, exaggeration=0.5, norm_loudness=True):
+    def build_conditionals(self, wav_fpath, exaggeration=0.5, norm_loudness=True) -> Conditionals:
+        """
+        Encode a reference wav into a self-contained Conditionals object.
+
+        This is the expensive, text-independent part of synthesis (disk load,
+        loudness norm, resample, and three encoder passes). The result depends
+        only on the reference audio, so it can be built once per voice and
+        reused for every request. Returns the Conditionals instead of mutating
+        self.conds so callers can cache it and pass it back into generate(),
+        which keeps concurrent requests for different voices from clobbering a
+        shared conditioning tensor.
+        """
         ## Load and norm reference wav
         s3gen_ref_wav, _sr = librosa.load(wav_fpath, sr=S3GEN_SR)
 
@@ -236,14 +248,20 @@ class ChatterboxTurboTTS:
 
         # Voice-encoder speaker embedding
         ve_embed = torch.from_numpy(self.ve.embeds_from_wavs([ref_16k_wav], sample_rate=S3_SR))
-        ve_embed = ve_embed.mean(axis=0, keepdim=True).to(self.device)
+        ve_embed = ve_embed.mean(axis=0, keepdim=True).to(device=self.device, dtype=torch.float32)
 
         t3_cond = T3Cond(
             speaker_emb=ve_embed,
             cond_prompt_speech_tokens=t3_cond_prompt_tokens,
             emotion_adv=exaggeration * torch.ones(1, 1, 1),
         ).to(device=self.device)
-        self.conds = Conditionals(t3_cond, s3gen_ref_dict)
+        return Conditionals(t3_cond, s3gen_ref_dict)
+
+    def prepare_conditionals(self, wav_fpath, exaggeration=0.5, norm_loudness=True):
+        """Build conditionals from a reference wav and store them on self.conds."""
+        self.conds = self.build_conditionals(
+            wav_fpath, exaggeration=exaggeration, norm_loudness=norm_loudness
+        )
 
     def generate(
         self,
@@ -252,16 +270,20 @@ class ChatterboxTurboTTS:
         min_p=0.00,
         top_p=0.95,
         audio_prompt_path=None,
+        conds: Conditionals = None,
         exaggeration=0.0,
         cfg_weight=0.0,
         temperature=0.8,
         top_k=1000,
         norm_loudness=True,
     ):
-        if audio_prompt_path:
-            self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration, norm_loudness=norm_loudness)
-        else:
-            assert self.conds is not None, "Please `prepare_conditionals` first or specify `audio_prompt_path`"
+        # Prefer explicitly-supplied (e.g. cached) conditionals; fall back to
+        # encoding a reference on the fly, then to the built-in self.conds.
+        if conds is None:
+            if audio_prompt_path:
+                self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration, norm_loudness=norm_loudness)
+            conds = self.conds
+        assert conds is not None, "Please pass `conds`, call `prepare_conditionals` first, or specify `audio_prompt_path`"
 
         if cfg_weight > 0.0 or exaggeration > 0.0 or min_p > 0.0:
             logger.warning("CFG, min_p and exaggeration are not supported by Turbo version and will be ignored.")
@@ -272,7 +294,7 @@ class ChatterboxTurboTTS:
         text_tokens = text_tokens.input_ids.to(self.device)
 
         speech_tokens = self.t3.inference_turbo(
-            t3_cond=self.conds.t3,
+            t3_cond=conds.t3,
             text_tokens=text_tokens,
             temperature=temperature,
             top_k=top_k,
@@ -288,7 +310,7 @@ class ChatterboxTurboTTS:
 
         wav, _ = self.s3gen.inference(
             speech_tokens=speech_tokens,
-            ref_dict=self.conds.gen,
+            ref_dict=conds.gen,
             n_cfm_timesteps=2,
         )
         wav = wav.squeeze(0).detach().cpu().numpy()

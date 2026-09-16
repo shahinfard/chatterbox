@@ -20,6 +20,61 @@ If you like the model but need to scale or tune it for higher accuracy, check ou
 
 <img width="1200" height="600" alt="Podonos Turbo Eval" src="https://storage.googleapis.com/chatterbox-demo-samples/turbo/podonos_turbo.png" />
 
+---
+
+## 🔌 This Fork: OpenAI-Compatible TTS API Server
+
+This fork wraps **Chatterbox-Turbo** in a self-hostable, OpenAI-compatible TTS
+HTTP server (`openai_api_server.py`) with multi-voice cloning, drop-in voice
+management, and tuning for low-latency, concurrent (multi-agent) use.
+
+### What it adds
+- **OpenAI-compatible endpoint** — `POST /v1/audio/speech` (drop-in for the
+  OpenAI TTS API), plus `/v1/audio/voices`, `/v1/models`, and `/health`.
+- **Voice cloning presets** — drop an audio file (`.wav` / `.mp3` / `.flac`,
+  longer than 5s) in the project root and it is auto-registered as a voice at
+  startup (`accent_name.ext` → voice id `accent-name`). ~45 curated voices ship
+  in this repo; the built-in `her` voice needs no file.
+- **Per-voice conditionals cache** — each voice's cloning "fingerprint"
+  (`Conditionals`) is encoded once at boot and held resident in VRAM instead of
+  re-encoding the reference on every request. Roughly halves single-request
+  latency and removes a voice-bleed race under concurrency.
+- **Concurrency cap** — `ServerConfig.MAX_IN_FLIGHT` bounds simultaneous GPU
+  generations so bursts (e.g. many agents at once) queue instead of collapsing
+  the GPU; generation runs off the event loop via a threadpool.
+- **Streaming & formats** — mp3 / opus / aac / flac / wav / pcm; optional
+  chunked streaming; Voxta-compatible voice discovery at
+  `/v1/audio/voices/voxta`.
+
+### Deploy elsewhere
+```shell
+git clone https://github.com/shahinfard/chatterbox.git
+cd chatterbox
+python3.11 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt      # model weights auto-download from HuggingFace on first run
+# voice .mp3/.wav files live in the project root (already included in this repo)
+./chatterbox-api.sh                   # or install the systemd unit (see below)
+```
+The server listens on `0.0.0.0:5005`. The GPU is selected in
+`openai_api_server.py` (`ServerConfig.MODEL_DEVICE`, default `cuda:0`) and/or via
+`CUDA_VISIBLE_DEVICES` in the systemd unit. Note: Turbo shares VRAM with whatever
+else is on the device, so ensure there is headroom for the model (~10 GB) plus
+per-request workspace.
+
+### Performance (warm, Chatterbox-Turbo)
+- Single ~100-char sentence: **RTF ≈ 0.18** (~0.8s for ~4.6s of audio).
+- Short (~30-char) utterance: **~320 ms**.
+- 3 concurrent requests: **RTF < 1** each (stays inside playback time) thanks to
+  the in-flight cap.
+
+### Helper scripts
+`chatterbox-start.sh` / `-stop.sh` / `-restart.sh` / `-status.sh` wrap the
+`chatterbox-api` systemd service; `install-systemd-service.sh` installs it.
+`voice_lab_server.py` (port 7070) is a small web UI for auditioning and renaming
+voices. See `API_SERVER_README.md` for full endpoint documentation.
+
+---
+
 ### ⚡ Model Zoo
 
 Choose the right model for your application.

@@ -46,3 +46,8 @@ checkpoints/
 
 # Ignore generated sample .wav files
 **/*.wav
+
+# Virtual environments (recreate from requirements.txt)
+venv/
+.venv/
+env/

@@ -167,6 +167,10 @@ class VoiceEncoder(nn.Module):
         :return: (B, E) embeddings on CPU
         """
         mel_lens = mel_lens.tolist() if torch.is_tensor(mel_lens) else mel_lens
+        
+        # Ensure mels are float32
+        if mels.dtype != torch.float32:
+            mels = mels.float()
 
         # Compute where to split the utterances into partials
         frame_step = get_frame_step(overlap, rate, self.hp)

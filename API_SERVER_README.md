@@ -1,6 +1,6 @@
 # Chatterbox TTS - OpenAI Compatible API Server
 
-This API server wraps Chatterbox TTS with an OpenAI-compatible `/v1/audio/speech` endpoint, making it easy to integrate with tools like OpenWebUI.
+This API server wraps **Chatterbox Turbo TTS** with an OpenAI-compatible `/v1/audio/speech` endpoint, making it easy to integrate with tools like OpenWebUI.
 
 ## Features
 
@@ -8,8 +8,21 @@ This API server wraps Chatterbox TTS with an OpenAI-compatible `/v1/audio/speech
 - **Voice Cloning** - Uses your custom voice samples (HER-sample1.wav/mp3)
 - **Streaming Support** - Real-time audio streaming with low latency
 - **Multiple Audio Formats** - MP3, WAV, OPUS, AAC, FLAC, PCM
-- **High Quality** - Powered by Chatterbox TTS with voice cloning
-- **Fast Inference** - Sub-realtime generation (RTF < 0.5 on GPU)
+- **High Quality** - Powered by Chatterbox Turbo TTS with voice cloning
+- **Ultra-Fast Inference** - **6x faster** than standard Chatterbox (RTF ~0.1-0.2 on GPU)
+- **Low Latency** - Optimized for voice agents and real-time applications
+
+## Model: Chatterbox Turbo
+
+This API server uses **Chatterbox Turbo**, a 350M parameter model optimized for low-latency applications:
+
+- **6x faster** than standard Chatterbox (500M)
+- **1-step decoding** (vs 10-step in standard)
+- **Lower VRAM** requirements
+- **English only** (multilingual not supported in Turbo)
+- Supports **paralinguistic tags**: `[laugh]`, `[chuckle]`, `[cough]`, `[gasp]`, etc.
+
+> **Note:** Turbo does not support `exaggeration` or `cfg_weight` parameters. These will be ignored if provided.
 
 ## Installation
 
@@ -59,7 +72,7 @@ Edit the `ServerConfig` class in `openai_api_server.py` to customize:
 ```python
 class ServerConfig:
     HOST = "0.0.0.0"           # Server host
-    PORT = 8000                # Server port
+    PORT = 5005                # Server port
     MODEL_DEVICE = "cuda"      # "cuda", "mps", or "cpu"
 
     # Voice presets mapping
@@ -69,10 +82,13 @@ class ServerConfig:
         ...
     }
 
-    # TTS generation parameters
-    DEFAULT_EXAGGERATION = 0.5      # Emotion control (0.0-1.0)
-    DEFAULT_CFG_WEIGHT = 0.5        # Guidance strength
+    # TTS generation parameters (Turbo-specific)
+    # Note: exaggeration and cfg_weight are NOT supported by Turbo
     DEFAULT_TEMPERATURE = 0.8       # Sampling randomness
+    DEFAULT_TOP_P = 0.95            # Nucleus sampling
+    DEFAULT_TOP_K = 1000            # Top-k sampling
+    DEFAULT_REPETITION_PENALTY = 1.2
+    DEFAULT_NORM_LOUDNESS = True    # Normalize to -27 LUFS
 ```
 
 ## API Usage
@@ -191,10 +207,17 @@ Type a message and click the speaker icon to hear it spoken with your cloned voi
   "speed": 1.0,                        // Optional: 0.25 to 4.0 (currently unused)
   "stream": false,                     // Optional: Enable streaming
 
-  // Extended Chatterbox parameters (optional)
-  "exaggeration": 0.5,                 // Emotion intensity (0.0-1.0)
-  "cfg_weight": 0.5,                   // Guidance weight (0.0-5.0)
-  "temperature": 0.8                   // Sampling temperature (0.1-2.0)
+  // Extended Chatterbox Turbo parameters (optional)
+  "temperature": 0.8,                  // Sampling temperature (0.1-2.0)
+  "top_k": 1000,                       // Top-k sampling (1-1000)
+  "top_p": 0.95,                       // Nucleus sampling (0.0-1.0)
+  "repetition_penalty": 1.2,           // Repetition penalty (1.0-2.0)
+  "norm_loudness": true,               // Normalize loudness to -27 LUFS
+
+  // Note: exaggeration and cfg_weight are NOT supported by Turbo
+  // They will be ignored if provided
+  "exaggeration": 0.5,                 // IGNORED by Turbo
+  "cfg_weight": 0.5                    // IGNORED by Turbo
 }
 ```
 
@@ -243,19 +266,22 @@ Supported output formats:
 
 ## Performance
 
-**GPU (NVIDIA 4090):**
-- First chunk latency: ~0.47s
-- Real-time factor (RTF): ~0.50
+**Chatterbox Turbo (GPU - e.g., NVIDIA 4090):**
+- First chunk latency: **~0.1-0.2s**
+- Real-time factor (RTF): **~0.1-0.2** (6x faster than standard)
 - Streaming: Yes, real-time capable
+- Model size: 350M parameters
 
-**CPU:**
-- Slower generation (RTF > 1.0)
-- Streaming still supported
-- May not achieve real-time
+**Chatterbox Turbo (CPU):**
+- Moderate generation speed
+- Streaming supported
+- May not achieve real-time for long texts
 
 **Apple Silicon (MPS):**
 - Good performance
 - Set `MODEL_DEVICE = "mps"`
+
+> **Note:** If you need multilingual support, you'll need to use the standard Chatterbox model (not Turbo). See the main Chatterbox documentation for details.
 
 ## Troubleshooting
 
@@ -263,9 +289,11 @@ Supported output formats:
 
 If model download fails:
 ```bash
-# Pre-download models
-python -c "from src.chatterbox.tts import ChatterboxTTS; ChatterboxTTS.from_pretrained()"
+# Pre-download Turbo models
+python -c "from src.chatterbox.tts_turbo import ChatterboxTurboTTS; ChatterboxTurboTTS.from_pretrained(device='cpu')"
 ```
+
+The Turbo model downloads from `ResembleAI/chatterbox-turbo` on HuggingFace (~1-1.5GB).
 
 ### Voice Sample Not Found
 
