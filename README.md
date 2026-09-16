@@ -67,6 +67,47 @@ per-request workspace.
 - 3 concurrent requests: **RTF < 1** each (stays inside playback time) thanks to
   the in-flight cap.
 
+### Output formats & streaming
+
+The response encoding is chosen per-request via the OpenAI-standard
+`response_format` field (sent alongside `model` / `voice` / `input`); it defaults
+to `mp3`:
+
+```json
+{ "model": "tts-1-hd", "voice": "british-nicole", "input": "…",
+  "response_format": "opus" }
+```
+
+The model natively produces a float32 waveform tensor (24 kHz, mono). `wav`/`pcm`
+are near-free to serialize; `mp3`/`opus`/`aac` are encoded via an `ffmpeg`
+subprocess. Measured on a ~6s clip (encode cost = extra wall time vs `wav`):
+
+| Format | Size (~6s) | Encode cost | Notes |
+|--------|-----------:|------------:|-------|
+| `pcm`  | ~329 KB | ~0 ms  | Raw samples, **no header** — smallest latency, largest bytes |
+| `wav`  | ~272 KB | ~0 ms  | Samples + header, lossless |
+| `flac` | ~140 KB | +55 ms | Lossless, no subprocess (soundfile) |
+| `opus` | ~53 KB  | +86 ms | **Best for mobile** — smallest, native streaming voice codec |
+| `mp3`  | ~56 KB  | +145 ms | Widest client compatibility |
+
+**For bandwidth-constrained clients (mobile), prefer `opus`** — it is the
+smallest and cheapest compressed option, and drops to ~20–25 KB for a 6s clip if
+tuned to a speech bitrate (~24–32 kbps). Use `mp3` only when the player cannot
+decode Opus.
+
+**PCM specifics** (for building a custom player): raw **16-bit signed,
+little-endian, mono, 24 kHz, no header** (`s16le`). The client must be told this
+format out-of-band since the bytes carry no metadata.
+
+**Streaming (`"stream": true`).** ⚠️ This is currently *pseudo-streaming*: the
+model generates the complete clip in a single `generate()` call, then the server
+chunks the finished buffer over a chunked HTTP response. You get incremental
+*delivery* (WAV/PCM send a header once, then raw sample chunks), but **not**
+incremental generation — time-to-first-audio is still ~the full generation time.
+True "hear the first word while the rest generates" streaming would require
+model-side incremental decoding (emitting audio as speech tokens are produced)
+plus progressive playback on the client; neither is implemented today.
+
 ### Helper scripts
 `chatterbox-start.sh` / `-stop.sh` / `-restart.sh` / `-status.sh` wrap the
 `chatterbox-api` systemd service; `install-systemd-service.sh` installs it.
