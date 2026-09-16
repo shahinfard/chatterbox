@@ -130,9 +130,15 @@ class ServerConfig:
     SAMPLE_RATE = 24000  # S3GEN_SR from Chatterbox
 
     # Concurrency: max simultaneous GPU generations. Extra requests queue (FIFO)
-    # rather than all contending for the same GPU at once, which keeps each
-    # in-flight request fast enough to stay inside the audio playback window.
-    MAX_IN_FLIGHT = 3
+    # rather than all contending for the same GPU at once.
+    #
+    # Set to 1 based on benchmarking (see performance-test-results.md): on a
+    # single (and here, contended) GPU, concurrency does not add throughput —
+    # 3-way parallel is ~2x SLOWER in total than sequential and delays the first
+    # response. Serializing GPU work is optimal, and mp3 encoding runs outside
+    # this lock so CPU encode still overlaps the next request's GPU work.
+    # Raise this only if TTS moves to a dedicated GPU with real headroom.
+    MAX_IN_FLIGHT = 1
 
 
 # ============================================================================
